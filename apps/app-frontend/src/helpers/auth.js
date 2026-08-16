@@ -64,3 +64,7 @@ export async function remove_user(user) {
 export async function users() {
 	return await invoke('plugin:auth|get_users')
 }
+
+export async function add_offline_user(username) {
+	return await invoke('plugin:auth|add_offline_user', { username })
+}

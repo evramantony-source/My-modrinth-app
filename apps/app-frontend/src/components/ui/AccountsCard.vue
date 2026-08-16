@@ -9,6 +9,10 @@
 			<SpinnerIcon v-else class="animate-spin" />
 			{{ formatMessage(messages.signInToMinecraft) }}
 		</Button>
+		<Button type="default" :disabled="loginDisabled" @click="addOfflineAccount()">
+			<PlusIcon />
+			Add offline account
+		</Button>
 	</div>
 	<Accordion
 		v-else
@@ -110,6 +114,7 @@ import { useAppEvent } from '@/composables/use-app-event'
 import { trackEvent } from '@/helpers/analytics'
 import {
 	get_default_user,
+	add_offline_user,
 	login as login_flow,
 	remove_user,
 	set_default_user,
@@ -238,6 +243,20 @@ async function login() {
 
 	trackEvent('AccountLogIn')
 	loginDisabled.value = false
+}
+
+async function addOfflineAccount() {
+	loginDisabled.value = true
+	try {
+		const username = window.prompt('Offline Minecraft username', '')?.trim()
+		if (!username) return
+		const account = await add_offline_user(username)
+		if (account) await setAccount(account)
+	} catch (error) {
+		handleError(error)
+	} finally {
+		loginDisabled.value = false
+	}
 }
 
 async function logout(id: string) {

@@ -18,6 +18,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
 use sha2::Digest;
+use md5::Digest as Md5Digest;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
@@ -169,6 +170,7 @@ pub async fn login_finish(
     minecraft_entitlements(&minecraft_token.access_token).await?;
 
     let mut credentials = Credentials {
+        offline: false,
         offline_profile: MinecraftProfile::default(),
         access_token: minecraft_token.access_token,
         refresh_token: oauth_token.value.refresh_token,
@@ -199,6 +201,7 @@ pub async fn login_finish(
 
 #[derive(Deserialize, Debug)]
 pub struct Credentials {
+    pub offline: bool,
     /// The offline profile of the user these credentials are for.
     ///
     /// Such a profile can only be relied upon to have a proper player UUID, which is
@@ -271,6 +274,8 @@ impl Credentials {
         &mut self,
         exec: impl sqlx::Executor<'_, Database = sqlx::Sqlite> + Copy,
     ) -> crate::Result<()> {
+        if self.offline { return Ok(()); }
+
         // Use a margin of 5 minutes to give e.g. Minecraft and potentially
         // other operations that depend on a fresh token 5 minutes to complete
         // from now, and deal with some classes of clock skew
@@ -351,6 +356,8 @@ impl Credentials {
         &self,
         cache_intent: OnlineProfileCacheIntent,
     ) -> Option<Arc<MinecraftProfile>> {
+        if self.offline { return None; }
+
         let max_age = cache_intent.max_age();
         let stale_profile = {
             let mut profile_cache = PROFILE_CACHE.lock().await;
@@ -519,7 +526,7 @@ impl Credentials {
         let res = sqlx::query!(
             "
             SELECT
-                uuid, active, username, access_token, refresh_token, expires
+                uuid, active, username, access_token, refresh_token, expires, offline
             FROM minecraft_users
             WHERE active = TRUE
             "
@@ -535,6 +542,7 @@ impl Credentials {
                         name: x.username,
                         ..MinecraftProfile::default()
                     },
+                    offline: x.offline == 1,
                     access_token: x.access_token,
                     refresh_token: x.refresh_token,
                     expires: Utc
@@ -556,7 +564,7 @@ impl Credentials {
         let res = sqlx::query!(
             "
             SELECT
-                uuid, active, username, access_token, refresh_token, expires
+                uuid, active, username, access_token, refresh_token, expires, offline
             FROM minecraft_users
             "
         )
@@ -611,14 +619,15 @@ impl Credentials {
 
         sqlx::query!(
             "
-            INSERT INTO minecraft_users (uuid, active, username, access_token, refresh_token, expires)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO minecraft_users (uuid, active, username, access_token, refresh_token, expires, offline)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (uuid) DO UPDATE SET
                 active = $2,
                 username = $3,
                 access_token = $4,
                 refresh_token = $5,
-                expires = $6
+                expires = $6,
+                offline = $7
             ",
             uuid,
             self.active,
@@ -626,6 +635,7 @@ impl Credentials {
             self.access_token,
             self.refresh_token,
             expires,
+            self.offline,
         )
             .execute(exec)
             .await?;
@@ -650,6 +660,21 @@ impl Credentials {
 
         Ok(())
     }
+}
+
+#[tracing::instrument]
+pub async fn add_offline_user(username: &str, exec: impl sqlx::Executor<'_, Database = sqlx::Sqlite> + Copy) -> crate::Result<Credentials> {
+    let username = username.trim();
+    if username.is_empty() || username.len() > 16 || !username.chars().all((c) => c.is_ascii_alphanumeric() || c === '_') {
+        return Err(crate::ErrorKind::InputError("Minecraft usernames must be 1-16 characters and contain only letters, numbers, or underscores".to_string()).into());
+    }
+    let mut hasher = md5::Md5::new();
+    hasher.update(format!("OfflinePlayer:{username}").as_bytes());
+    let mut bytes = hasher.finalize().into();
+    bytes[6] = (bytes[6] & 0x0f) | 0x30; bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let uuid = Uuid::from_bytes(bytes);
+    let credentials = Credentials { offline: true, offline_profile: MinecraftProfile { id: uuid, name: username.to_string(), ..MinecraftProfile::default() }, access_token: "0".to_string(), refresh_token: String::new(), expires: Utc::now() + Duration::days(36500), active: true };
+    credentials.upsert(exec).await?; Ok(credentials)
 }
 
 impl Serialize for Credentials {
@@ -682,12 +707,13 @@ impl Serialize for Credentials {
                 ),
         };
 
-        let mut ser = serializer.serialize_struct("Credentials", 5)?;
+        let mut ser = serializer.serialize_struct("Credentials", 6)?;
         ser.serialize_field("profile", &*profile)?;
         ser.serialize_field("access_token", &self.access_token)?;
         ser.serialize_field("refresh_token", &self.refresh_token)?;
         ser.serialize_field("expires", &self.expires)?;
         ser.serialize_field("active", &self.active)?;
+        ser.serialize_field("offline", &self.offline)?;
         ser.end()
     }
 }

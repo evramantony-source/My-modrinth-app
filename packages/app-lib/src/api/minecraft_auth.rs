@@ -88,3 +88,9 @@ pub async fn users() -> crate::Result<Vec<Credentials>> {
     let users = Credentials::get_all(&state.pool).await?;
     Ok(users.into_iter().map(|x| x.1).collect())
 }
+
+#[tracing::instrument]
+pub async fn add_offline_user(username: &str) -> crate::Result<Credentials> {
+    let state = State::get().await?;
+    crate::state::add_offline_user(username, &state.pool).await
+}
