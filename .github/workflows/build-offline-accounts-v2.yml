@@ -1,0 +1,110 @@
+name: Build Windows EXE - Offline Accounts v2
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - offline-accounts
+
+permissions:
+  contents: write
+
+env:
+  MODRINTH_API_URL: https://api.modrinth.com/v2/
+  MODRINTH_API_URL_V3: https://api.modrinth.com/v3/
+  MODRINTH_API_BASE_URL: https://api.modrinth.com/
+  SHARED_INSTANCES_API_BASE_URL: https://api.modrinth.com/
+  MODRINTH_LAUNCHER_META_URL: https://launcher-meta.modrinth.com/
+  MODRINTH_SOCKET_URL: wss://socket.modrinth.com/
+  MODRINTH_URL: https://modrinth.com/
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.15.0
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+          run_install: false
+      - name: Apply offline account source changes
+        shell: pwsh
+        run: |
+          @'
+          const fs = require('fs'), path = require('path'); const root = process.cwd();
+          const file = p => path.join(root,p);
+          function edit(p,from,to){const f=file(p);let s=fs.readFileSync(f,'utf8');if(!s.includes(from))throw new Error('Patch anchor not found: '+p);fs.writeFileSync(f,s.replace(from,to));}
+          function editAll(p,from,to){const f=file(p);let s=fs.readFileSync(f,'utf8');if(!s.includes(from))throw new Error('Patch anchor not found: '+p);fs.writeFileSync(f,s.split(from).join(to));}
+          function append(p,t){fs.appendFileSync(file(p),t);}
+          edit('Cargo.toml','maxminddb = "0.26.0"','maxminddb = "0.26.0"\nmd-5 = "0.10.6"');
+          edit('packages/app-lib/Cargo.toml','uuid = { workspace = true, features = ["serde", "v4"] }','uuid = { workspace = true, features = ["serde", "v4"] }\nmd-5 = { workspace = true }');
+          edit('Cargo.lock',' "json5",\n "modrinth-content-management",',' "json5",\n "md-5",\n "modrinth-content-management",');
+          edit('apps/app/build.rs','"get_users",\n','"get_users",\n                        "add_offline_user",\n');
+          edit('apps/app/src/api/auth.rs','            get_users,\n','            get_users,\n            add_offline_user,\n');
+          append('apps/app/src/api/auth.rs','\n#[tauri::command]\npub async fn add_offline_user(username: String) -> Result<Credentials> {\n    Ok(minecraft_auth::add_offline_user(&username).await?)\n}\n');
+          edit('apps/app-frontend/src/helpers/auth.js',"export async function users() {\n\treturn await invoke('plugin:auth|get_users')\n}","export async function users() {\n\treturn await invoke('plugin:auth|get_users')\n}\n\nexport async function add_offline_user(username) {\n\treturn await invoke('plugin:auth|add_offline_user', { username })\n}");
+          edit('apps/app-frontend/src/components/ui/AccountsCard.vue','get_default_user,\n','get_default_user,\n\tadd_offline_user,\n');
+          edit('apps/app-frontend/src/components/ui/AccountsCard.vue','async function logout(id: string) {',"async function addOfflineAccount() {\n\tloginDisabled.value = true\n\ttry {\n\t\tconst username = window.prompt('Offline Minecraft username', '')?.trim()\n\t\tif (!username) return\n\t\tconst account = await add_offline_user(username)\n\t\tif (account) await setAccount(account)\n\t} catch (error) {\n\t\thandleError(error)\n\t} finally {\n\t\tloginDisabled.value = false\n\t}\n}\n\nasync function logout(id: string) {");
+          edit('apps/app-frontend/src/components/ui/AccountsCard.vue','{{ formatMessage(messages.signInToMinecraft) }}\n\t\t</Button>','{{ formatMessage(messages.signInToMinecraft) }}\n\t\t</Button>\n\t\t<Button type="default" :disabled="loginDisabled" @click="addOfflineAccount()">\n\t\t\t<PlusIcon />\n\t\t\tAdd offline account\n\t\t</Button>');
+          edit('packages/app-lib/src/state/minecraft_auth.rs','use sha2::Digest;','use sha2::Digest;\nuse md5::Digest as Md5Digest;');
+          edit('packages/app-lib/src/state/minecraft_auth.rs','pub struct Credentials {','pub struct Credentials {\n    pub offline: bool,');
+          edit('packages/app-lib/src/state/minecraft_auth.rs','let mut credentials = Credentials {\n','let mut credentials = Credentials {\n        offline: false,\n');
+          edit('packages/app-lib/src/state/minecraft_auth.rs','        // Use a margin of 5 minutes','        if self.offline { return Ok(()); }\n\n        // Use a margin of 5 minutes');
+          edit('packages/app-lib/src/state/minecraft_auth.rs','        let max_age = cache_intent.max_age();','        if self.offline { return None; }\n\n        let max_age = cache_intent.max_age();');
+          editAll('packages/app-lib/src/state/minecraft_auth.rs','uuid, active, username, access_token, refresh_token, expires\n            FROM minecraft_users','uuid, active, username, access_token, refresh_token, expires, offline\n            FROM minecraft_users');
+          editAll('packages/app-lib/src/state/minecraft_auth.rs','                    access_token: x.access_token,','                    offline: x.offline == 1,\n                    access_token: x.access_token,');
+          edit('packages/app-lib/src/state/minecraft_auth.rs','INSERT INTO minecraft_users (uuid, active, username, access_token, refresh_token, expires)','INSERT INTO minecraft_users (uuid, active, username, access_token, refresh_token, expires, offline)');
+          edit('packages/app-lib/src/state/minecraft_auth.rs','VALUES ($1, $2, $3, $4, $5, $6)','VALUES ($1, $2, $3, $4, $5, $6, $7)');
+          edit('packages/app-lib/src/state/minecraft_auth.rs','expires = $6\n','expires = $6,\n                offline = $7\n');
+          edit('packages/app-lib/src/state/minecraft_auth.rs','            expires,\n        )','            expires,\n            self.offline,\n        )');
+          const marker='\nimpl Serialize for Credentials {';
+          const fn=`\n#[tracing::instrument]\npub async fn add_offline_user(username: &str, exec: impl sqlx::Executor<'_, Database = sqlx::Sqlite> + Copy) -> crate::Result<Credentials> {\n    let username = username.trim();\n    if username.is_empty() || username.len() > 16 || !username.chars().all(c => c.is_ascii_alphanumeric() || c == '_') {\n        return Err(crate::ErrorKind::InputError("Minecraft usernames must be 1-16 characters and contain only letters, numbers, or underscores".to_string()).into());\n    }\n    let mut hasher = md5::Md5::new(); hasher.update(format!("OfflinePlayer:{username}").as_bytes());\n    let mut bytes = hasher.finalize().into(); bytes[6]=(bytes[6]&0x0f)|0x30; bytes[8]=(bytes[8]&0x3f)|0x80;\n    let uuid=Uuid::from_bytes(bytes);\n    let credentials=Credentials{offline:true,offline_profile:MinecraftProfile{id:uuid,name:username.to_string(),..MinecraftProfile::default()},access_token:"0".to_string(),refresh_token:String::new(),expires:Utc::now()+Duration::days(36500),active:true};\n    credentials.upsert(exec).await?; Ok(credentials)\n}\n`;
+          const f=file('packages/app-lib/src/state/minecraft_auth.rs'); let ms=fs.readFileSync(f,'utf8'); if(!ms.includes(marker))throw new Error('serialize marker missing'); fs.writeFileSync(f,ms.replace(marker,fn+marker));
+          edit('packages/app-lib/src/state/minecraft_auth.rs','let mut ser = serializer.serialize_struct("Credentials", 5)?;','let mut ser = serializer.serialize_struct("Credentials", 6)?;');
+          edit('packages/app-lib/src/state/minecraft_auth.rs','ser.serialize_field("active", &self.active)?;','ser.serialize_field("active", &self.active)?;\n        ser.serialize_field("offline", &self.offline)?;');
+          edit('packages/app-lib/src/state/legacy_converter.rs','Credentials {\n                    offline_profile:','Credentials {\n                    offline: false,\n                    offline_profile:');
+          append('packages/app-lib/src/api/minecraft_auth.rs','\n#[tracing::instrument]\npub async fn add_offline_user(username: &str) -> crate::Result<Credentials> {\n    let state = State::get().await?;\n    crate::state::add_offline_user(username, &state.pool).await\n}\n');
+          edit('packages/app-lib/src/api/instance/run.rs','if let Some(project_id) = server_play_project_id(&context.link)','if !credentials.offline\n        && let Some(project_id) = server_play_project_id(&context.link)');
+          edit('packages/app-lib/src/launcher/args.rs','let access_token = credentials.access_token.clone();','let access_token = if credentials.offline { "0".to_string() } else { credentials.access_token.clone() };');
+          edit('packages/app-lib/src/launcher/args.rs','quick_play_type,\n                )','quick_play_type,\n                    credentials.offline,\n                )');
+          edit('packages/app-lib/src/launcher/args.rs','quick_play_type,\n            )?','quick_play_type,\n                credentials.offline,\n            )?');
+          edit('packages/app-lib/src/launcher/args.rs','quick_play_type: &QuickPlayType,\n) -> crate::Result<String> {','quick_play_type: &QuickPlayType,\n    offline: bool,\n) -> crate::Result<String> {');
+          edit('packages/app-lib/src/launcher/args.rs','.replace("${user_type}", "msa")','.replace("${user_type}", if offline { "legacy" } else { "msa" })');
+          fs.writeFileSync(file('packages/app-lib/migrations/20260816000000-offline-accounts.sql'),'ALTER TABLE minecraft_users ADD COLUMN offline INTEGER NOT NULL DEFAULT FALSE;\n');
+          '@ | node
+      - name: Persist source changes
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock apps/app/build.rs apps/app/src/api/auth.rs apps/app-frontend/src/components/ui/AccountsCard.vue apps/app-frontend/src/helpers/auth.js packages/app-lib/Cargo.toml packages/app-lib/migrations/20260816000000-offline-accounts.sql packages/app-lib/src/api/instance/run.rs packages/app-lib/src/api/minecraft_auth.rs packages/app-lib/src/launcher/args.rs packages/app-lib/src/state/legacy_converter.rs packages/app-lib/src/state/minecraft_auth.rs
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) { git commit -m "Add offline Minecraft accounts [skip ci]"; git push }
+      - name: Setup Rust 1.95
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0-x86_64-pc-windows-msvc
+          targets: x86_64-pc-windows-msvc
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build Windows application
+        run: pnpm app:build
+        env:
+          CI: true
+          RUSTUP_TOOLCHAIN: 1.95.0-x86_64-pc-windows-msvc
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Modrinth-App-Windows-x64
+          if-no-files-found: error
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+            apps/app/target/release/bundle/nsis/*.exe
+            apps/app/target/release/bundle/msi/*.msi
