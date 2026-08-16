@@ -12,7 +12,7 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,7 +42,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build Windows application
-        run: pnpm --filter @modrinth/app build
+        run: pnpm app:build
         env:
           CI: true
 
@@ -52,6 +52,8 @@ jobs:
           name: Modrinth-App-Windows-x64
           if-no-files-found: error
           path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
             apps/app/target/release/bundle/nsis/*.exe
             apps/app/target/release/bundle/msi/*.msi
 
@@ -59,8 +61,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Modrinth-App-Windows-x64-portable
-          if-no-files-found: error
-          path: apps/app/target/release/Modrinth App.exe
-
-  # This second job intentionally makes a new push when the workflow file is changed,
-  # ensuring the corrected workflow is exercised on the offline-accounts branch.
+          if-no-files-found: warn
+          path: |
+            target/release/*.exe
+            apps/app/target/release/*.exe
