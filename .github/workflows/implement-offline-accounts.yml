@@ -1,0 +1,119 @@
+name: Apply offline account implementation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [offline-accounts]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ !startsWith(github.event.head_commit.message, 'feat: implement offline accounts') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: offline-accounts
+          fetch-depth: 0
+
+      - name: Patch source
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(path, pattern, replacement):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              new, count = re.subn(pattern, replacement, text, count=1, flags=re.MULTILINE)
+              if count != 1:
+                  raise SystemExit(f'{path}: expected one match, found {count}')
+              p.write_text(new, encoding='utf-8')
+
+          # Never refresh or query Mojang for explicitly offline credentials.
+          replace_once(
+              'packages/app-lib/src/state/minecraft_auth.rs',
+              r'(async fn refresh\(\n\s*&mut self,\n\s*exec: impl sqlx::Executor<.*?\n\s*\) -> crate::Result<\(\)> \{\n)(\s*// Use a margin of 5 minutes)',
+              r'\1        // Offline testing credentials never contact Microsoft, Xbox, or Mojang.\n        if self.access_token.starts_with("offline:") {\n            return Ok(());\n        }\n\n\2'
+          )
+
+          replace_once(
+              'packages/app-lib/src/state/minecraft_auth.rs',
+              r'(pub async fn maybe_online_profile\(\n\s*&self,\n\s*\) -> MaybeOnlineMinecraftProfile<\'_\> \{\n)(\s*let online_profile = self\.online_profile\(\)\.await;)',
+              r'\1        if self.access_token.starts_with("offline:") {\n            return MaybeOnlineMinecraftProfile::Offline(&self.offline_profile);\n        }\n\n\2'
+          )
+
+          # Public app-lib API used by the Tauri frontend.
+          replace_once(
+              'packages/app-lib/src/state/minecraft_auth.rs',
+              r'(\n#\[derive\(Deserialize, Debug\)\]\npub struct Credentials \{)',
+              r'''\n/// Creates a local-only Minecraft account for testing.\n/// No Microsoft/Xbox/Mojang authentication is performed.\npub async fn create_offline_user(name: &str) -> crate::Result<Credentials> {\n    let name = name.trim();\n    if name.len() < 3 || name.len() > 16 {\n        return Err(io::Error::other("Minecraft usernames must be 3-16 characters").into());\n    }\n    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {\n        return Err(io::Error::other("Minecraft usernames may only contain letters, numbers, and underscores").into());\n    }\n\n    let credentials = Credentials {\n        offline_profile: MinecraftProfile {\n            id: Uuid::new_v4(),\n            name: name.to_string(),\n            ..MinecraftProfile::default()\n        },\n        access_token: format!("offline:{}", Uuid::new_v4()),\n        refresh_token: "offline".to_string(),\n        expires: Utc::now() + Duration::days(36500),\n        active: true,\n    };\n\n    let state = crate::State::get().await?;\n    credentials.upsert(&state.pool).await?;\n    Ok(credentials)\n}\n\1'''
+          )
+
+          # Tell Minecraft that this profile is not an MSA profile.
+          replace_once(
+              'packages/app-lib/src/launcher/args.rs',
+              r'\.replace\("\$\{user_type\}", "msa"\)',
+              r'.replace("${user_type}", if access_token.starts_with("offline:") { "legacy" } else { "msa" })'
+          )
+
+          # Tauri command.
+          replace_once(
+              'apps/app/src/api/auth.rs',
+              r'(\s*get_users,\n)(\s*\]\)',
+              r'\1            create_offline_user,\n\2'
+          )
+          replace_once(
+              'apps/app/src/api/auth.rs',
+              r'(pub async fn get_users\(\) -> Result<Vec<Credentials>> \{\n\s*Ok\(minecraft_auth::users\(\)\.await\?\)\n\})',
+              r'''\1\n\n#[tauri::command]\npub async fn create_offline_user(name: String) -> Result<Credentials> {\n    Ok(minecraft_auth::create_offline_user(&name).await?)\n}'''
+          )
+
+          # Frontend helper.
+          replace_once(
+              'apps/app-frontend/src/helpers/auth.js',
+              r'(export async function users\(\) \{\n\treturn await invoke\(\'plugin:auth\|get_users\'\)\n\}\n?)$',
+              r'''\1\nexport async function create_offline_user(name) {\n\treturn await invoke('plugin:auth|create_offline_user', { name })\n}\n'''
+          )
+
+          # Account picker: make offline accounts available without Microsoft sign-in.
+          replace_once(
+              'apps/app-frontend/src/components/ui/AccountsCard.vue',
+              r'(\tget_default_user,\n)',
+              r'\tcreate_offline_user,\n\1'
+          )
+          replace_once(
+              'apps/app-frontend/src/components/ui/AccountsCard.vue',
+              r'(\t\t<Button type="colored" color="brand" :disabled="loginDisabled" @click="login\(\)">.*?\t\t</Button>)',
+              r'''\1\n\t\t<Button class="w-full" :disabled="loginDisabled" @click="addOfflineAccount()">\n\t\t\t<PlusIcon />\n\t\t\tOffline account (testing)\n\t\t</Button>'''
+          )
+          replace_once(
+              'apps/app-frontend/src/components/ui/AccountsCard.vue',
+              r'(async function login\(\) \{)',
+              r'''async function addOfflineAccount() {\n\tconst name = window.prompt('Offline testing account username', 'TestPlayer')?.trim()\n\tif (!name) return\n\n\tloginDisabled.value = true\n\ttry {\n\t\tconst account = await create_offline_user(name)\n\t\tawait setAccount(account)\n\t} catch (error) {\n\t\thandleError(error)\n\t} finally {\n\t\tloginDisabled.value = false\n\t}\n}\n\n\1'''
+          )
+
+          p = Path('apps/app-frontend/src/components/ui/AccountsCard.vue')
+          text = p.read_text(encoding='utf-8')
+          # Add the same option to the expanded account picker.
+          anchor = "\t\t\t\t\t{{ formatMessage(messages.addAccount) }}\n\t\t\t\t</Button>"
+          if anchor in text and 'Offline account (testing)' not in text:
+              text = text.replace(anchor, anchor + "\n\t\t\t\t<Button class=\"w-full\" :disabled=\"loginDisabled\" @click=\"addOfflineAccount()\">\n\t\t\t\t\t<PlusIcon />\n\t\t\t\t\tOffline account (testing)\n\t\t\t\t</Button>", 1)
+          p.write_text(text, encoding='utf-8')
+
+          print('Offline account implementation patched successfully.')
+          PY
+
+      - name: Commit implementation
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/app-lib/src/state/minecraft_auth.rs packages/app-lib/src/launcher/args.rs apps/app/src/api/auth.rs apps/app-frontend/src/helpers/auth.js apps/app-frontend/src/components/ui/AccountsCard.vue
+          git diff --cached --quiet && exit 0
+          git commit -m "feat: implement offline accounts"
+          git push origin offline-accounts
