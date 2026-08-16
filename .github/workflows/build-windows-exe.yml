@@ -61,3 +61,6 @@ jobs:
           name: Modrinth-App-Windows-x64-portable
           if-no-files-found: error
           path: apps/app/target/release/Modrinth App.exe
+
+  # This second job intentionally makes a new push when the workflow file is changed,
+  # ensuring the corrected workflow is exercised on the offline-accounts branch.
